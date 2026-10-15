@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Steganografia LSB na 3. i 4. najmniej znaczącym bicie (implementacja algorytmu z artykułu).
@@ -15,17 +14,21 @@ Uwaga: wiadomość jest kodowana w UTF-8, więc limit 1023 dotyczy bajtów
 (polskie litery zajmują 2 bajty). Dla czystego ASCII bajty = znaki.
 
 Użycie:
-    python stego_lsb.py                      -> uruchamia GUI
+    python stego_lsb.py                      -> GUI (tkinter; jeśli go brak - interfejs w przeglądarce)
+    python stego_lsb.py web [--port 8000]    -> interfejs w przeglądarce (bez tkintera)
     python stego_lsb.py embed  in.png out.bmp -m "tajna wiadomość" [-y 200 -x 1]
     python stego_lsb.py extract out.bmp [-y 200 -x 1]
     python stego_lsb.py compare in.png out.bmp
 
-Wymagania: pip install pillow numpy   (tkinter jest w standardowej instalacji Pythona)
+Wymagania: pip install pillow numpy   (tkinter jest opcjonalny)
 Obraz wynikowy zapisuj w formacie bezstratnym (BMP/PNG) - JPEG zniszczy ukryte dane.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import io
+import json
 import sys
 from pathlib import Path
 
@@ -54,12 +57,20 @@ def load_gray(path: str | Path) -> np.ndarray:
         return np.array(im.convert("L"), dtype=np.uint8)
 
 
+def encode_image(arr: np.ndarray, fmt: str = "BMP") -> bytes:
+    fmt = fmt.upper()
+    if fmt not in ("BMP", "PNG"):
+        raise StegoError("Obsługiwane formaty wyjściowe: BMP i PNG (bezstratne).")
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, format=fmt)
+    return buf.getvalue()
+
+
 def save_image(arr: np.ndarray, path: str | Path) -> None:
     ext = Path(path).suffix.lower()
     if ext in (".jpg", ".jpeg"):
         raise StegoError("Format JPEG jest stratny i zniszczy ukryte dane. Użyj BMP lub PNG.")
-    fmt = "PNG" if ext == ".png" else "BMP"
-    Image.fromarray(arr, mode="L").save(path, format=fmt)
+    Path(path).write_bytes(encode_image(arr, "PNG" if ext == ".png" else "BMP"))
 
 
 def _positions(shape: tuple[int, int], y: int, x: int):
@@ -140,10 +151,17 @@ def compare(a: np.ndarray, b: np.ndarray) -> dict:
 #  GUI (tkinter)
 # --------------------------------------------------------------------------- #
 def run_gui() -> None:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    try:
+        import tkinter as tk
+        from tkinter import filedialog, messagebox, ttk
 
-    from PIL import ImageTk
+        from PIL import ImageTk
+    except ImportError:
+        print("Brak tkintera (lub Pillow.ImageTk) - uruchamiam interfejs w przeglądarce.\n"
+              "  (tkinter doinstalujesz: Debian/Ubuntu: sudo apt install python3-tk; "
+              "Fedora: sudo dnf install python3-tkinter; macOS: brew install python-tk)")
+        run_web()
+        return
 
     IMG_TYPES = [("Obrazy", "*.bmp *.png *.jpg *.jpeg *.tif *.tiff"), ("Wszystkie pliki", "*.*")]
 
@@ -239,6 +257,178 @@ def run_gui() -> None:
             if arr is not None:
                 self.cover, self.marked = arr, None
                 self.show("cover", self.lbl_cover, arr)
+                self.lbl_result.configure(image="", text="(obraz ze znakiem wodnym)")
+
+        def on_embed(self) -> None:
+            try:
+                if self.cover is None:
+                    raise StegoError("Najpierw wczytaj obraz.")
+                y, x = self.coords()
+                msg = self.txt_msg.get("1.0", "end-1c")
+                result = embed(self.cover, msg, y, x)
+            except StegoError as e:
+                messagebox.showwarning("Uwaga", str(e))
+                return
+            self.marked = result
+            self.show("result", self.lbl_result, result)
+            stats = compare(self.cover, result)
+            path = filedialog.asksaveasfilename(
+                defaultextension=".bmp", initialfile="watermarked_image.bmp",
+                filetypes=[("BMP", "*.bmp"), ("PNG", "*.png")])
+            if path:
+                try:
+                    save_image(result, path)
+                except Exception as e:  # noqa: BLE001
+                    messagebox.showerror("Błąd zapisu", str(e))
+                    return
+                self.status.set(f"Zapisano {Path(path).name}  |  PSNR = {stats['psnr']:.2f} dB, "
+                                f"zmienionych pikseli: {stats['changed']}")
+            else:
+                self.status.set("Osadzono (nie zapisano pliku). "
+                                f"PSNR = {stats['psnr']:.2f} dB, zmienionych pikseli: {stats['changed']}")
+
+        # ---------------- zakładka: wyodrębnianie ---------------- #
+        def _build_extract_tab(self, nb: ttk.Notebook) -> None:
+            t = ttk.Frame(nb)
+            nb.add(t, text="Wyodrębnianie")
+            top = ttk.Frame(t)
+            top.pack(fill="x", padx=8, pady=6)
+            ttk.Button(top, text="Wczytaj obraz ze znakiem wodnym…", command=self.on_load_marked).pack(side="left")
+            ttk.Button(top, text="Użyj ostatnio wygenerowanego", command=self.on_use_last).pack(side="left", padx=6)
+            ttk.Button(top, text="Wyodrębnij wiadomość", command=self.on_extract).pack(side="left", padx=6)
+
+            self.lbl_marked = ttk.Label(t, text="(obraz)", anchor="center")
+            self.lbl_marked.pack(side="left", expand=True, padx=8)
+
+            right = ttk.Frame(t)
+            right.pack(side="left", fill="both", expand=True, padx=8, pady=4)
+            ttk.Label(right, text="Odczytana wiadomość:").pack(anchor="w")
+            self.txt_out = tk.Text(right, wrap="word", state="disabled")
+            self.txt_out.pack(fill="both", expand=True)
+
+        def on_load_marked(self) -> None:
+            arr = self.ask_open()
+            if arr is not None:
+                self.marked = arr
+                self.show("marked", self.lbl_marked, arr, (400, 400))
+
+        def on_use_last(self) -> None:
+            if self.marked is None:
+                messagebox.showinfo("Info", "Nie ma jeszcze wygenerowanego obrazu.")
+                return
+            self.show("marked", self.lbl_marked, self.marked, (400, 400))
+
+        def on_extract(self) -> None:
+            try:
+                if self.marked is None:
+                    raise StegoError("Najpierw wczytaj obraz ze znakiem wodnym.")
+                y, x = self.coords()
+                text = extract(self.marked, y, x)
+            except StegoError as e:
+                messagebox.showwarning("Uwaga", str(e))
+                return
+            self.txt_out.configure(state="normal")
+            self.txt_out.delete("1.0", "end")
+            self.txt_out.insert("1.0", text)
+            self.txt_out.configure(state="disabled")
+            self.status.set(f"Odczytano {len(text.encode('utf-8'))} bajtów.")
+
+        # ---------------- zakładka: porównanie ---------------- #
+        def _build_compare_tab(self, nb: ttk.Notebook) -> None:
+            t = ttk.Frame(nb)
+            nb.add(t, text="Porównanie")
+            top = ttk.Frame(t)
+            top.pack(fill="x", padx=8, pady=6)
+            ttk.Button(top, text="Wczytaj oryginał…", command=self.on_cmp_cover).pack(side="left")
+            ttk.Button(top, text="Wczytaj obraz ze znakiem wodnym…", command=self.on_cmp_marked).pack(side="left", padx=6)
+            ttk.Button(top, text="Porównaj (odejmij)", command=self.on_compare).pack(side="left", padx=6)
+            self.lbl_stats = ttk.Label(t, text="")
+            self.lbl_stats.pack(anchor="w", padx=8)
+            self.lbl_diff = ttk.Label(t, text="(obraz różnicy, wzmocniony 20×)", anchor="center")
+            self.lbl_diff.pack(fill="both", expand=True, padx=8, pady=4)
+
+        def on_cmp_cover(self) -> None:
+            arr = self.ask_open()
+            if arr is not None:
+                self.cover = arr
+
+        def on_cmp_marked(self) -> None:
+            arr = self.ask_open()
+            if arr is not None:
+                self.marked = arr
+
+        def on_compare(self) -> None:
+            try:
+                if self.cover is None or self.marked is None:
+                    raise StegoError("Potrzebny jest oryginał i obraz ze znakiem wodnym.")
+                s = compare(self.cover, self.marked)
+            except StegoError as e:
+                messagebox.showwarning("Uwaga", str(e))
+                return
+            psnr = "∞" if s["psnr"] == float("inf") else f"{s['psnr']:.2f} dB"
+            self.lbl_stats.configure(
+                text=f"Zmienionych pikseli: {s['changed']}   |   max różnica: {s['max_diff']}   |   "
+                     f"MSE: {s['mse']:.4f}   |   PSNR: {psnr}")
+            self.show("diff", self.lbl_diff, s["diff_img"], (520, 520))
+
+    App().mainloop()
+
+
+# --------------------------------------------------------------------------- #
+#  Interfejs w przeglądarce (tylko biblioteka standardowa, serwer lokalny)
+# --------------------------------------------------------------------------- #
+WEB_PAGE = r"""<!doctype html>
+<html lang="pl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Steganografia LSB - 3. i 4. bit</title>
+<style>
+  :root{--bg:#fafafa;--fg:#222;--card:#fff;--bd:#d0d0d0;--ac:#2563eb}
+  @media (prefers-color-scheme:dark){:root{--bg:#1b1b1d;--fg:#e8e8e8;--card:#26262a;--bd:#444;--ac:#6b9bff}}
+  body{font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:980px;margin:18px auto;padding:0 12px}
+  h1{font-size:1.3rem}
+  .card{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:12px;margin:10px 0}
+  .tabs button{padding:8px 14px;border:1px solid var(--bd);background:var(--card);color:var(--fg);cursor:pointer;border-radius:6px 6px 0 0}
+  .tabs button.on{background:var(--ac);color:#fff;border-color:var(--ac)}
+  .tab{display:none}.tab.on{display:block}
+  textarea{width:100%;box-sizing:border-box;height:120px;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px}
+  input[type=number]{width:80px}
+  button.act{padding:7px 14px;background:var(--ac);color:#fff;border:0;border-radius:6px;cursor:pointer;margin:6px 6px 6px 0}
+  .row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:260px;text-align:center}
+  img{max-width:100%;max-height:380px;border:1px solid var(--bd);image-rendering:pixelated}
+  .err{color:#d33;font-weight:600}.ok{color:#2a8a3a}.small{font-size:.85rem;opacity:.8}
+  a.dl{display:inline-block;margin:6px 0;color:var(--ac)}
+</style></head><body>
+<h1>Steganografia LSB - 3. i 4. bit</h1>
+<div class="card">Współrzędne startowe (klucz - takie same przy osadzaniu i odczycie):
+  y <input id="y" type="number" min="1" value="200"> &nbsp; x <input id="x" type="number" min="1" value="1">
+  <span class="small">(liczone od 1; w artykule y=200, x=1)</span></div>
+<div class="tabs"><button data-t="t1" class="on">Osadzanie</button><button data-t="t2">Wyodrębnianie</button><button data-t="t3">Porównanie</button></div>
+<div id="msg" class="card small">Gotowy.</div>
+
+<div id="t1" class="tab on card">
+  <p>1. Wybierz obraz (okładka): <input type="file" id="f1" accept="image/*"></p>
+  <p>2. Tajna wiadomość: <span id="cnt" class="small">0 / 1023 bajtów</span></p>
+  <textarea id="m"></textarea>
+  <p>Format wyjściowy: <select id="fmt"><option>BMP</option><option>PNG</option></select>
+  <button class="act" id="go1">3. Osadź</button></p>
+  <a id="dl" class="dl" style="display:none">⬇ Pobierz obraz ze znakiem wodnym</a>
+  <div class="row"><div><div>Oryginał</div><img id="i1" alt=""></div><div><div>Ze znakiem wodnym</div><img id="i2" alt=""></div></div>
+</div>
+
+<div id="t2" class="tab card">
+  <p>Obraz ze znakiem wodnym: <input type="file" id="f2" accept="image/*">
+  <button class="act" id="use">Użyj ostatnio wygenerowanego</button></p>
+  <button class="act" id="go2">Wyodrębnij wiadomość</button>
+  <textarea id="out" readonly placeholder="Tu pojawi się odczytana wiadomość"></textarea>
+  <div style="text-align:center"><img id="i3" alt=""></div>
+</div>
+
+<div id="t3" class="tab card">
+  <p>Oryginał: <input type="file" id="f3a" accept="image/*"></p>
+  <p>Ze znakiem wodnym: <input type="file" id="f3b" accept="image/*"></p>
+  <button class="act" id="go3">Porównaj (odejmij)</button>
+  <p id="stats"></p>
+  <div style="text-align:center"><div class="small">Różnica wzmocniona 20×</div><img id="i4" alt=""></dlbl_cover, arr)
                 self.lbl_result.configure(image="", text="(obraz ze znakiem wodnym)")
 
         def on_embed(self) -> None:
